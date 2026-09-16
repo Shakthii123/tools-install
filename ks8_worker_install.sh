@@ -15,8 +15,8 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-#if have any error run this cmd
-sed -i 's/\r$//' ks8_worker_install.sh && sed -i 's/\r$//' /home/pc/devops/docker/docker_install.sh
+# remove any carriage returns from this script (in case it was edited on Windows)
+sed -i 's/\r$//' ks8_worker_install.sh
 
 # The join command printed by ks8_install_master.sh (step 21) must be passed
 # in as arguments, e.g.:

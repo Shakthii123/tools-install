@@ -20,6 +20,9 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# Remove any carriage returns from this script (in case it was edited on Windows)
+sed -i 's/\r$//' docker_install.sh
+
 run_step "1. 🐳 Installing Docker Engine..."
 if command -v docker &>/dev/null; then
     log "Docker already installed: $(docker --version)"

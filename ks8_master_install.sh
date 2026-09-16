@@ -19,8 +19,8 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-#if have any error run this cmd
-sed -i 's/\r$//' ks8_master_install.sh && sed -i 's/\r$//' /home/pc/devops/docker/docker_install.sh
+# remove any carriage returns from this script (in case it was edited on Windows)
+sed -i 's/\r$//' ks8_master_install.sh
 
 run_step "0. Changing Docker to Execute Mode"
 pwd

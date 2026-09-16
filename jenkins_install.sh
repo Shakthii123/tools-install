@@ -31,6 +31,9 @@ err() {
     exit 1
 }
 
+# remove any carriage returns from this script (in case it was edited on Windows)
+sed -i 's/\r$//' jenkins_install.sh
+
 run_step "0. Pre-flight checks"
 
 if [[ $EUID -ne 0 ]]; then
