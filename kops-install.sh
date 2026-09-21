@@ -1,3 +1,4 @@
+
 #!/usr/bin/env bash
 #
 # kops-setup.sh - Install kops + kubectl and create a Kubernetes cluster on AWS
