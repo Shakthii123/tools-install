@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 #
 # kops-setup.sh - Install kops + kubectl and create a Kubernetes cluster on AWS
@@ -10,7 +9,16 @@
 #   ./kops-setup.sh validate    Validate an existing cluster
 #   ./kops-setup.sh delete      Delete the cluster (asks for confirmation)
 #
-# Every setting below can be overridden with an environment variable, e.g.:
+# When run in a terminal, create/all ask for each cluster setting with `read`
+# (press Enter to keep the value shown in [brackets]). validate/delete ask only
+# for the cluster name and region. Prompts are skipped when ASSUME_YES=true,
+# PROMPT=false, or input is not a terminal.
+#
+# If the script stops unexpectedly, the failing line and command are printed.
+# Run with DEBUG=true to trace every command.
+#
+# Every setting below can also be set with an environment variable, which becomes
+# the default shown in the prompt, e.g.:
 #   CLUSTER_NAME=dev.k8s.local NODE_COUNT=3 AWS_REGION=eu-west-1 ./kops-setup.sh all
 #
 # Prerequisites:
@@ -18,7 +26,7 @@
 #   - The IAM user/role needs: EC2, ELB, Auto Scaling, IAM, S3, SQS, EventBridge,
 #     and Route53 (only if you use a real DNS name instead of gossip DNS).
 #
-set -euo pipefail
+set -Eeuo pipefail
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -27,8 +35,8 @@ set -euo pipefail
 # For a real domain use e.g. CLUSTER_NAME=k8s.example.com (needs a Route53 zone).
 CLUSTER_NAME="${CLUSTER_NAME:-demo.k8s.local}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
-ZONES="${ZONES:-${AWS_REGION}a,${AWS_REGION}b,${AWS_REGION}c}"        # worker node zones
-CONTROL_PLANE_ZONES="${CONTROL_PLANE_ZONES:-${AWS_REGION}a}"          # 1 zone = 1 control-plane node
+ZONES="${ZONES:-}"                                                    # empty = <region>a,b,c (worker zones)
+CONTROL_PLANE_ZONES="${CONTROL_PLANE_ZONES:-}"                        # empty = <region>a (1 zone = 1 control-plane node)
 NODE_COUNT="${NODE_COUNT:-2}"
 NODE_SIZE="${NODE_SIZE:-t3.medium}"
 CONTROL_PLANE_SIZE="${CONTROL_PLANE_SIZE:-t3.medium}"
@@ -37,7 +45,8 @@ KOPS_VERSION="${KOPS_VERSION:-}"                                      # empty = 
 SSH_PUBLIC_KEY="${SSH_PUBLIC_KEY:-$HOME/.ssh/id_rsa.pub}"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 VALIDATE_TIMEOUT="${VALIDATE_TIMEOUT:-15m}"
-ASSUME_YES="${ASSUME_YES:-false}"                                     # true = skip prompts
+ASSUME_YES="${ASSUME_YES:-false}"                                     # true = skip all prompts
+PROMPT="${PROMPT:-true}"                                              # false = don't ask for settings
 KOPS_STATE_BUCKET="${KOPS_STATE_BUCKET:-}"                            # empty = auto-generated
 
 # --------------------------------------------------------------------------
@@ -49,10 +58,73 @@ die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+WORKDIR=""
+cleanup() { [[ -n "$WORKDIR" ]] && rm -rf "$WORKDIR"; return 0; }
+trap cleanup EXIT
+
+# Report exactly which command made the script stop (errexit is otherwise silent).
+on_err() {
+  local code="$1" line="$2" cmd="$3"
+  printf '\033[1;31mERROR:\033[0m command failed (exit %s) at line %s:\n         %s\n' "$code" "$line" "$cmd" >&2
+}
+trap 'on_err "$?" "$LINENO" "$BASH_COMMAND"' ERR
+
+# DEBUG=true ./script.sh ...  prints every command as it runs.
+if [[ "${DEBUG:-false}" == "true" ]]; then set -x; fi
+
 confirm() {
   [[ "$ASSUME_YES" == "true" ]] && return 0
   read -r -p "$1 [y/N] " reply
   [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+# Fill in zone defaults from the region if they were not set explicitly.
+apply_zone_defaults() {
+  [[ -n "$ZONES" ]] || ZONES="${AWS_REGION}a,${AWS_REGION}b,${AWS_REGION}c"
+  [[ -n "$CONTROL_PLANE_ZONES" ]] || CONTROL_PLANE_ZONES="${AWS_REGION}a"
+  return 0
+}
+
+# ask VAR "Label" - show the current value as the default and read a new one.
+ask() {
+  local var="$1" label="$2" current reply=""
+  current="${!var}"
+  read -r -p "  ${label} [${current:-<default>}]: " reply || true
+  if [[ -n "$reply" ]]; then
+    printf -v "$var" '%s' "$reply"
+  fi
+  return 0
+}
+
+# prompt_config full|basic - interactively collect settings with `read`.
+prompt_config() {
+  local mode="${1:-full}"
+  if [[ "$PROMPT" != "true" || "$ASSUME_YES" == "true" || ! -t 0 ]]; then
+    apply_zone_defaults
+    return 0
+  fi
+
+  echo
+  log "Enter values (press Enter to keep the value shown in [brackets]):"
+  ask CLUSTER_NAME "Cluster name"
+  ask AWS_REGION   "AWS region"
+  apply_zone_defaults    # zone defaults depend on the region just entered
+
+  if [[ "$mode" == "full" ]]; then
+    ask ZONES               "Worker node zones (comma-separated)"
+    ask CONTROL_PLANE_ZONES "Control-plane zones (1 zone = 1 node)"
+    ask NODE_COUNT          "Worker node count"
+    ask NODE_SIZE           "Worker instance type"
+    ask CONTROL_PLANE_SIZE  "Control-plane instance type"
+    ask K8S_VERSION         "Kubernetes version (blank = kops default)"
+    ask SSH_PUBLIC_KEY      "SSH public key path"
+    ask VALIDATE_TIMEOUT    "Validation timeout"
+  fi
+  echo
+
+  [[ -n "$CLUSTER_NAME" ]] || die "Cluster name cannot be empty."
+  [[ -n "$AWS_REGION" ]]   || die "AWS region cannot be empty."
+  [[ "$NODE_COUNT" =~ ^[0-9]+$ && "$NODE_COUNT" -ge 1 ]] || die "Worker node count must be a positive number."
 }
 
 SUDO=""
@@ -95,12 +167,11 @@ install_kubectl() {
     return
   fi
   log "Installing kubectl..."
-  local tmp ver
-  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
+  local ver
   ver="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
-  curl -fsSL -o "$tmp/kubectl" "https://dl.k8s.io/release/${ver}/bin/${OS}/${ARCH}/kubectl"
-  verify_sha256 "$tmp/kubectl" "$(curl -fsSL "https://dl.k8s.io/release/${ver}/bin/${OS}/${ARCH}/kubectl.sha256")"
-  $SUDO install -m 0755 "$tmp/kubectl" "$INSTALL_DIR/kubectl"
+  curl -fsSL -o "$WORKDIR/kubectl" "https://dl.k8s.io/release/${ver}/bin/${OS}/${ARCH}/kubectl"
+  verify_sha256 "$WORKDIR/kubectl" "$(curl -fsSL "https://dl.k8s.io/release/${ver}/bin/${OS}/${ARCH}/kubectl.sha256")"
+  $SUDO install -m 0755 "$WORKDIR/kubectl" "$INSTALL_DIR/kubectl"
   log "Installed kubectl ${ver}"
 }
 
@@ -118,17 +189,35 @@ install_kops() {
   fi
 
   log "Installing kops ${ver}..."
-  local tmp url
-  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
+  local url
   url="https://github.com/kubernetes/kops/releases/download/${ver}/kops-${OS}-${ARCH}"
-  curl -fsSL -o "$tmp/kops" "$url"
-  if curl -fsSL -o "$tmp/kops.sha256" "${url}.sha256" 2>/dev/null; then
-    verify_sha256 "$tmp/kops" "$(awk '{print $1}' "$tmp/kops.sha256")"
+  curl -fsSL -o "$WORKDIR/kops" "$url"
+  if curl -fsSL -o "$WORKDIR/kops.sha256" "${url}.sha256" 2>/dev/null; then
+    verify_sha256 "$WORKDIR/kops" "$(awk '{print $1}' "$WORKDIR/kops.sha256")"
   else
     warn "No checksum file found for kops ${ver}; skipping verification."
   fi
-  $SUDO install -m 0755 "$tmp/kops" "$INSTALL_DIR/kops"
+  $SUDO install -m 0755 "$WORKDIR/kops" "$INSTALL_DIR/kops"
   log "Installed $(kops version | head -n1)"
+}
+
+install_unzip() {
+  have unzip && return 0
+  log "unzip not found - installing it..."
+  local pkg_sudo=""
+  if [[ "$EUID" -ne 0 ]]; then
+    have sudo || die "'unzip' is missing and sudo is not available to install it. Install unzip manually and re-run."
+    pkg_sudo="sudo"
+  fi
+  if   have apt-get; then $pkg_sudo apt-get update -y >/dev/null && $pkg_sudo apt-get install -y unzip
+  elif have dnf;     then $pkg_sudo dnf install -y unzip
+  elif have yum;     then $pkg_sudo yum install -y unzip
+  elif have zypper;  then $pkg_sudo zypper --non-interactive install unzip
+  elif have apk;     then $pkg_sudo apk add --no-cache unzip
+  elif have pacman;  then $pkg_sudo pacman -Sy --noconfirm unzip
+  else die "No supported package manager found. Install 'unzip' manually and re-run."
+  fi
+  have unzip || die "unzip installation failed. Install it manually and re-run."
 }
 
 install_awscli() {
@@ -139,14 +228,13 @@ install_awscli() {
   if [[ "$OS" != "linux" ]]; then
     die "AWS CLI not found. Install it first (macOS: 'brew install awscli')."
   fi
-  have unzip || die "'unzip' is required to install the AWS CLI. Install it and re-run."
+  install_unzip
   log "Installing AWS CLI v2..."
-  local tmp arch
-  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
+  local arch
   [[ "$ARCH" == "arm64" ]] && arch="aarch64" || arch="x86_64"
-  curl -fsSL -o "$tmp/awscliv2.zip" "https://awscli.amazonaws.com/awscli-exe-linux-${arch}.zip"
-  unzip -q "$tmp/awscliv2.zip" -d "$tmp"
-  ${SUDO:-} "$tmp/aws/install" --update
+  curl -fsSL -o "$WORKDIR/awscliv2.zip" "https://awscli.amazonaws.com/awscli-exe-linux-${arch}.zip"
+  unzip -q "$WORKDIR/awscliv2.zip" -d "$WORKDIR"
+  ${SUDO:-} "$WORKDIR/aws/install" --update
   log "Installed $(aws --version 2>&1 | head -n1)"
 }
 
@@ -154,6 +242,7 @@ do_install() {
   have curl || die "curl is required."
   detect_platform
   detect_sudo
+  WORKDIR="$(mktemp -d)"
   install_awscli
   install_kubectl
   install_kops
@@ -277,7 +366,7 @@ do_delete() {
 }
 
 usage() {
-  sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,/^# Prerequisites:/{/^# Prerequisites:/!p}' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # --------------------------------------------------------------------------
@@ -285,10 +374,10 @@ usage() {
 # --------------------------------------------------------------------------
 case "${1:-help}" in
   install)  do_install ;;
-  create)   do_create ;;
-  all)      do_install; do_create ;;
-  validate) do_validate ;;
-  delete)   do_delete ;;
+  create)   prompt_config full;  do_create ;;
+  all)      do_install; prompt_config full;  do_create ;;
+  validate) prompt_config basic; do_validate ;;
+  delete)   prompt_config basic; do_delete ;;
   help|-h|--help) usage ;;
   *) usage; exit 1 ;;
 esac

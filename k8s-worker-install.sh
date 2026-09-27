@@ -16,7 +16,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # remove any carriage returns from this script (in case it was edited on Windows)
-sed -i 's/\r$//' ks8_worker_install.sh
+sed -i 's/\r$//' ks8-worker-install.sh
 
 # The join command printed by ks8_install_master.sh (step 21) must be passed
 # in as arguments, e.g.:

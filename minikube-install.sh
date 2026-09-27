@@ -19,7 +19,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # remove any carriage returns from this script (in case it was edited on Windows)
-sed -i 's/\r$//' minikube_install.sh
+sed -i 's/\r$//' minikube-install.sh
 
 echo "Starting Minikube installation on Ubuntu..."
 

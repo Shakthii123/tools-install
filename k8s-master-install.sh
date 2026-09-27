@@ -20,7 +20,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # remove any carriage returns from this script (in case it was edited on Windows)
-sed -i 's/\r$//' ks8_master_install.sh
+sed -i 's/\r$//' ks8-master-install.sh
 
 run_step "0. Changing Docker to Execute Mode"
 pwd

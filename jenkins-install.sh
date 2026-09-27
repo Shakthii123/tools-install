@@ -32,7 +32,7 @@ err() {
 }
 
 # remove any carriage returns from this script (in case it was edited on Windows)
-sed -i 's/\r$//' jenkins_install.sh
+sed -i 's/\r$//' jenkins-install.sh
 
 run_step "0. Pre-flight checks"
 
