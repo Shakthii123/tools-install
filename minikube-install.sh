@@ -25,9 +25,9 @@ echo "Starting Minikube installation on Ubuntu..."
 
 run_step "0. Changing Docker to Execute Mode"
 pwd
-if sudo chmod +x $PWD/docker_install.sh
+if sudo chmod +x $PWD/docker-install.sh
 then
-    . $PWD/docker_install.sh
+    . $PWD/docker-install.sh
 fi
 
 run_step "9. Checking Prerequisites"

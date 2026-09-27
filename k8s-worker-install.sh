@@ -31,9 +31,9 @@ JOIN_CMD="$*"
 
 run_step "0. Changing docker script to Execute Mode"
 pwd
-if sudo chmod +x $PWDdocker_install.sh
-then 
-  . $PWDdocker_install.sh
+if sudo chmod +x $PWDdocker-install.sh
+then
+  . $PWDdocker-install.sh
 else
     echo "Docker not Installed"
     exit 1
