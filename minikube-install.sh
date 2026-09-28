@@ -1,7 +1,18 @@
 #!/bin/bash
+#
+# minikube-install.sh
+# Installs Docker, kubectl and Minikube and starts a 2-node cluster on:
+#   - Ubuntu / Debian
+#   - Amazon Linux 2 / 2023   (x86_64 and arm64/Graviton)
+# Requires docker-install.sh in the same directory. Safe to re-run.
+#
+# Usage:  sudo ./minikube-install.sh
 
 # Exit immediately if a command exits with a non-zero status
 set -e
+
+K8S_MINOR="${K8S_MINOR:-1.30}"
+K8S_VERSION="${K8S_VERSION:-v1.30.0}"
 
 run_step() {
     echo "======== $1 ========"
@@ -18,28 +29,69 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# remove any carriage returns from this script (in case it was edited on Windows)
-sed -i 's/\r$//' minikube-install.sh
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
-echo "Starting Minikube installation on Ubuntu..."
+# Remove any carriage returns from this script (in case it was edited on Windows)
+sed -i 's/\r$//' "$SCRIPT_PATH"
 
-run_step "0. Changing Docker to Execute Mode"
-pwd
-if sudo chmod +x $PWD/docker-install.sh
-then
-    . $PWD/docker-install.sh
+# ---------------------------------------------------------------------------
+# OS / architecture detection
+# ---------------------------------------------------------------------------
+os_field() { grep -E "^$1=" /etc/os-release | head -n1 | cut -d= -f2- | tr -d '"'; }
+OS_ID="$(os_field ID)"
+OS_ID_LIKE="$(os_field ID_LIKE)"
+
+case "$OS_ID" in
+    ubuntu|debian|amzn) ;;
+    *)
+        if [[ "$OS_ID_LIKE" != *debian* ]]; then
+            err "Unsupported OS '${OS_ID:-unknown}'. Supported: Ubuntu, Debian, Amazon Linux."
+            exit 1
+        fi
+        ;;
+esac
+
+case "$(uname -m)" in
+    x86_64|amd64)  ARCH="amd64" ;;
+    aarch64|arm64) ARCH="arm64" ;;
+    *) err "Unsupported architecture: $(uname -m)"; exit 1 ;;
+esac
+
+echo "Starting Minikube installation on $(os_field PRETTY_NAME) ($ARCH)..."
+
+# The non-root user who will run minikube
+ACTUAL_USER="${SUDO_USER:-root}"
+
+# Run a command as ACTUAL_USER, with the docker group active even if the
+# user was only just added to it (no re-login needed).
+as_user() {
+    if [[ "$ACTUAL_USER" != "root" ]]; then
+        sudo -u "$ACTUAL_USER" -H sg docker -c "$(printf '%q ' "$@")"
+    else
+        "$@"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+run_step "0. Docker"
+if command -v docker &>/dev/null && grep -qs 'SystemdCgroup = true' /etc/containerd/config.toml; then
+    log "Docker already configured, skipping docker-install.sh"
+elif [[ -f "$SCRIPT_DIR/docker-install.sh" ]]; then
+    chmod +x "$SCRIPT_DIR/docker-install.sh"
+    . "$SCRIPT_DIR/docker-install.sh"
+else
+    err "docker-install.sh not found in $SCRIPT_DIR"
+    exit 1
 fi
 
-run_step "9. Checking Prerequisites"
+run_step "1. Checking Prerequisites"
 
-# Check if Docker is installed and running
 if ! command -v docker &>/dev/null; then
     err "Docker is not installed!"
-    err "Please install Docker first using docker_install_fixed.sh"
     exit 1
-else
-    log "Docker found: $(docker --version)"
 fi
+log "Docker found: $(docker --version)"
 
 if ! systemctl is-active --quiet docker; then
     warn "Docker daemon is not running. Starting it..."
@@ -47,125 +99,81 @@ if ! systemctl is-active --quiet docker; then
     sleep 2
 fi
 
-# Check user is in docker group
-if [[ -n "${SUDO_USER:-}" ]]; then
-    DOCKER_USER="$SUDO_USER"
-else
-    DOCKER_USER="$USER"
+if [[ "$ACTUAL_USER" != "root" ]]; then
+    if id -nG "$ACTUAL_USER" | grep -qw docker; then
+        log "User '$ACTUAL_USER' is in docker group"
+    else
+        warn "User '$ACTUAL_USER' is NOT in docker group. Adding..."
+        usermod -aG docker "$ACTUAL_USER"
+        log "Log out and back in later for the group change to apply everywhere"
+    fi
 fi
-
-if id -nG "$DOCKER_USER" | grep -qw docker; then
-    log "User '$DOCKER_USER' is in docker group"
-else
-    warn "User '$DOCKER_USER' is NOT in docker group. Adding..."
-    usermod -aG docker "$DOCKER_USER"
-    log "Please log out and log back in for group changes to take effect"
-fi
-
 echo ""
 
-run_step "10. Disabling Swap (Required by Kubernetes)"
-if grep -q "swap" /etc/fstab; then
-    swapoff -a
-    sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
-    log "Swap disabled"
-else
-    log "Swap already disabled"
-fi
-
+run_step "2. Disabling Swap (Required by Kubernetes)"
+swapoff -a
+sed -i '/^[^#].*[[:space:]]swap[[:space:]]/ s/^/#/' /etc/fstab
+log "Swap disabled"
 echo ""
 
-run_step "11. Installing kubectl..."
+run_step "3. Installing kubectl"
 if command -v kubectl &>/dev/null; then
-    log "kubectl already installed: $(kubectl version --client --short 2>/dev/null || echo 'installed')"
+    log "kubectl already installed: $(kubectl version --client 2>/dev/null | head -n1)"
 else
-    log "Installing kubectl..."
-    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-    echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /' | tee /etc/apt/sources.list.d/kubernetes.list > /dev/null
-    apt-get update
-    apt-get install -y kubectl=1.30.* kubelet=1.30.*
-    apt-mark hold kubectl kubelet
+    KVER="$(curl -fsSL "https://dl.k8s.io/release/stable-${K8S_MINOR}.txt")"
+    log "Installing kubectl ${KVER}..."
+    TMP="$(mktemp)"
+    curl -fsSL -o "$TMP" "https://dl.k8s.io/release/${KVER}/bin/linux/${ARCH}/kubectl"
+    install -m 0755 "$TMP" /usr/local/bin/kubectl
+    rm -f "$TMP"
     log "kubectl installed"
 fi
-
 echo ""
 
-run_step "12. Installing Minikube..."
+run_step "4. Installing Minikube"
 if command -v minikube &>/dev/null; then
-    log "minikube already installed: $(minikube version 2>/dev/null || echo 'installed')"
+    log "minikube already installed: $(minikube version 2>/dev/null | head -n1)"
 else
     log "Installing minikube..."
-    curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
-    install minikube-linux-amd64 /usr/local/bin/minikube
-    rm -f minikube-linux-amd64
+    TMP="$(mktemp)"
+    curl -fsSL -o "$TMP" "https://storage.googleapis.com/minikube/releases/latest/minikube-linux-${ARCH}"
+    install -m 0755 "$TMP" /usr/local/bin/minikube
+    rm -f "$TMP"
     log "minikube installed"
 fi
-
 echo ""
 
-run_step "13. Checking Versions"
+run_step "5. Checking Versions"
 log "Versions:"
 echo "  - $(docker --version)"
-echo "  - $(kubectl version --client --short 2>/dev/null || kubectl version --client)"
-echo "  - $(minikube version)"
-
+echo "  - kubectl $(kubectl version --client 2>/dev/null | head -n1)"
+echo "  - $(minikube version | head -n1)"
 echo ""
 
-run_step "14. Starting Minikube Cluster (2 nodes)"
-
-# Get the actual user for minikube
-if [[ -n "${SUDO_USER:-}" ]]; then
-    ACTUAL_USER="$SUDO_USER"
-else
-    ACTUAL_USER="root"
-fi
-
+run_step "6. Starting Minikube Cluster (2 nodes)"
 log "Starting minikube as user: $ACTUAL_USER"
-
-# Start minikube with proper user context
-if [[ "$ACTUAL_USER" != "root" ]]; then
-    sudo -u "$ACTUAL_USER" minikube start \
-        --nodes=2 \
-        --driver=docker \
-        --kubernetes-version=v1.30.0 \
-        --addons=metrics-server,dashboard
-else
-    minikube start \
-        --nodes=2 \
-        --driver=docker \
-        --kubernetes-version=v1.30.0 \
-        --addons=metrics-server,dashboard
+MK_ARGS=(--nodes=2 --driver=docker "--kubernetes-version=${K8S_VERSION}" --addons=metrics-server,dashboard)
+if [[ "$ACTUAL_USER" == "root" ]]; then
+    warn "Running as root - minikube needs --force for the docker driver. Prefer running via sudo from a normal user."
+    MK_ARGS+=(--force)
 fi
-
+as_user minikube start "${MK_ARGS[@]}"
 echo ""
 
-run_step "15. Configuring Worker Nodes"
-if [[ "$ACTUAL_USER" != "root" ]]; then
-    sudo -u "$ACTUAL_USER" kubectl label node minikube-m02 kubernetes.io/role=worker1 --overwrite
-else
-    kubectl label node minikube-m02 kubernetes.io/role=worker1 --overwrite
-fi
+run_step "7. Configuring Worker Nodes"
+as_user kubectl label node minikube-m02 kubernetes.io/role=worker1 --overwrite
 log "Worker node labeled"
-
 echo ""
 
-run_step "16. Verifying Cluster"
-if [[ "$ACTUAL_USER" != "root" ]]; then
-    log "Cluster status:"
-    sudo -u "$ACTUAL_USER" minikube status
-    echo ""
-    log "Nodes:"
-    sudo -u "$ACTUAL_USER" kubectl get nodes
-else
-    log "Cluster status:"
-    minikube status
-    echo ""
-    log "Nodes:"
-    kubectl get nodes
-fi
+run_step "8. Verifying Cluster"
+log "Cluster status:"
+as_user minikube status
+echo ""
+log "Nodes:"
+as_user kubectl get nodes
 
 echo ""
-log "✅ Minikube installation complete!"
+log "Minikube installation complete!"
 echo ""
 echo "  kubectl get pods -A                          # List all pods"
 echo "  minikube dashboard                           # Open web dashboard"
@@ -173,4 +181,4 @@ echo "  minikube stop                                # Stop the cluster"
 echo "  minikube delete                              # Delete the cluster"
 echo "  kubectl apply -f <your-deployment>.yaml      # Deploy your app"
 echo ""
-echo "Restart the Terminal and Start Minikube"
+echo "Restart the Terminal (or run 'newgrp docker') and start using Minikube"

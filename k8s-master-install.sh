@@ -1,9 +1,19 @@
 #!/bin/bash
+#
+# k8s-master-install.sh
+# Sets up a single-node Kubernetes control plane (kubeadm + Flannel) on:
+#   - Ubuntu / Debian
+#   - Amazon Linux 2 / 2023
+# Requires docker-install.sh in the same directory. Safe to re-run.
+#
+# Usage:  sudo ./k8s-master-install.sh
 
 # Exit immediately if a command exits with a non-zero status
 set -e
 
-# Helper function to print text and sleep for 3 seconds
+K8S_MINOR="${K8S_MINOR:-v1.30}"
+POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
+
 run_step() {
     echo "=== $1 ==="
     sleep 3
@@ -19,131 +29,176 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# remove any carriage returns from this script (in case it was edited on Windows)
-sed -i 's/\r$//' k8s-master-install.sh
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
-run_step "0. Changing Docker to Execute Mode"
-pwd
-if sudo chmod +x $PWD/docker-install.sh
-then
-    . $PWD/docker-install.sh
-fi
+# Remove any carriage returns from this script (in case it was edited on Windows)
+sed -i 's/\r$//' "$SCRIPT_PATH"
 
-run_step "9. Checking Prerequisites"
+# ---------------------------------------------------------------------------
+# OS detection
+# ---------------------------------------------------------------------------
+os_field() { grep -E "^$1=" /etc/os-release | head -n1 | cut -d= -f2- | tr -d '"'; }
+OS_ID="$(os_field ID)"
+OS_ID_LIKE="$(os_field ID_LIKE)"
 
-# Check if Docker is installed and running
-if ! command -v docker &>/dev/null; then
-    err "Docker is not installed!"
-    err "Please install Docker first using docker_install_fixed.sh"
+case "$OS_ID" in
+    ubuntu|debian) FAMILY="debian" ;;
+    amzn)          FAMILY="amazon" ;;
+    *)
+        if [[ "$OS_ID_LIKE" == *debian* ]]; then
+            FAMILY="debian"
+        else
+            err "Unsupported OS '${OS_ID:-unknown}'. Supported: Ubuntu, Debian, Amazon Linux."
+            exit 1
+        fi
+        ;;
+esac
+log "Detected OS: $OS_ID (family: $FAMILY)"
+
+if command -v dnf &>/dev/null; then PKG=dnf; else PKG=yum; fi
+
+# The non-root user who invoked sudo (kubeconfig will be set up for them)
+TARGET_USER="${SUDO_USER:-root}"
+USER_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+
+# ---------------------------------------------------------------------------
+# Container runtime (Docker + containerd with SystemdCgroup)
+# ---------------------------------------------------------------------------
+run_step "0. Container runtime (Docker + containerd)"
+if command -v docker &>/dev/null && grep -qs 'SystemdCgroup = true' /etc/containerd/config.toml; then
+    log "Docker/containerd already configured, skipping docker-install.sh"
+elif [[ -f "$SCRIPT_DIR/docker-install.sh" ]]; then
+    chmod +x "$SCRIPT_DIR/docker-install.sh"
+    . "$SCRIPT_DIR/docker-install.sh"
+else
+    err "docker-install.sh not found in $SCRIPT_DIR"
     exit 1
-else
-    log "Docker found: $(docker --version)"
-fi
-
-if ! systemctl is-active --quiet docker; then
-    warn "Docker daemon is not running. Starting it..."
-    systemctl start docker
-    sleep 2
-fi
-
-# Check user is in docker group
-if [[ -n "${SUDO_USER:-}" ]]; then
-    DOCKER_USER="$SUDO_USER"
-else
-    DOCKER_USER="$USER"
-fi
-
-if id -nG "$DOCKER_USER" | grep -qw docker; then
-    log "User '$DOCKER_USER' is in docker group"
-else
-    warn "User '$DOCKER_USER' is NOT in docker group. Adding..."
-    usermod -aG docker "$DOCKER_USER"
-    log "Please log out and log back in for group changes to take effect"
 fi
 echo ""
 
-run_step "10. Disabling Swap (Required by Kubernetes)"
-if grep -q "swap" /etc/fstab; then
-    swapoff -a
-    sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
-    log "Swap disabled"
-else
-    log "Swap already disabled"
-fi
-
+# ---------------------------------------------------------------------------
+# Swap
+# ---------------------------------------------------------------------------
+run_step "1. Disabling Swap (Required by Kubernetes)"
+swapoff -a
+sed -i '/^[^#].*[[:space:]]swap[[:space:]]/ s/^/#/' /etc/fstab
+log "Swap disabled"
 echo ""
 
-run_step "11. Installing kubectl..."
-if command -v kubectl &>/dev/null; then
-    log "kubectl already installed: $(kubectl version --client --short 2>/dev/null || echo 'installed')"
-else
-    log "Installing kubectl..."
-    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-    echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+# ---------------------------------------------------------------------------
+# Kubernetes packages
+# ---------------------------------------------------------------------------
+run_step "2. Installing kubelet, kubeadm and kubectl"
+if command -v kubeadm &>/dev/null && command -v kubelet &>/dev/null && command -v kubectl &>/dev/null; then
+    log "Kubernetes packages already installed: $(kubeadm version -o short)"
+elif [[ "$FAMILY" == "debian" ]]; then
     apt-get update
-    apt-get install -y kubectl=1.30.* kubelet=1.30.* kubeadm=1.30.*
+    apt-get install -y apt-transport-https ca-certificates curl gpg
+    mkdir -p -m 755 /etc/apt/keyrings
+    curl -fsSL "https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/Release.key" \
+        | gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/ /" \
+        > /etc/apt/sources.list.d/kubernetes.list
+    apt-get update
+    apt-get install -y kubelet kubeadm kubectl
     apt-mark hold kubelet kubeadm kubectl
-    systemctl enable --now kubelet
-    log "kubelet, kubeadm & kubectl Installed"
+else
+    # Amazon Linux: SELinux must not block the kubelet / container runtime
+    if command -v getenforce &>/dev/null && [[ "$(getenforce)" == "Enforcing" ]]; then
+        setenforce 0
+        sed -i 's/^SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config
+        log "SELinux set to permissive"
+    fi
+    cat > /etc/yum.repos.d/kubernetes.repo <<EOF
+[kubernetes]
+name=Kubernetes
+baseurl=https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/rpm/
+enabled=1
+gpgcheck=1
+gpgkey=https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/rpm/repodata/repomd.xml.key
+exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
+EOF
+    $PKG install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+    $PKG install -y iproute-tc || true   # 'tc' is checked by kubeadm preflight
 fi
+# kubeadm starts the kubelet itself; enabling is enough
+systemctl enable kubelet
+log "kubelet, kubeadm & kubectl ready"
 echo ""
 
-run_step "12. Checking Versions"
+run_step "3. Checking Versions"
 log "Versions:"
 echo "  - $(docker --version)"
-echo "  - $(kubectl version --client --short 2>/dev/null || kubectl version --client)"
-echo "  - $(kubeadm version --client --short 2>/dev/null || kubeadm version --client)"
-echo "  - $(kubelet version --client --short 2>/dev/null || kubelet version --client)"
+echo "  - kubectl $(kubectl version --client 2>/dev/null | head -n1)"
+echo "  - kubeadm $(kubeadm version -o short)"
+echo "  - kubelet $(kubelet --version)"
 echo ""
 
-run_step "13. Enable kernel modules"
-sudo modprobe br_netfilter
+# ---------------------------------------------------------------------------
+# Kernel modules / sysctl (persistent)
+# ---------------------------------------------------------------------------
+run_step "4. Enable kernel modules and sysctl settings"
+printf 'overlay\nbr_netfilter\n' > /etc/modules-load.d/k8s.conf
+modprobe overlay
+modprobe br_netfilter
+cat > /etc/sysctl.d/k8s.conf <<EOF
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+sysctl --system >/dev/null
+log "Kernel modules loaded and sysctl applied (persistent across reboots)"
 echo ""
 
-run_step "14. Add some settings to sysctl"
-sudo sysctl -w net.ipv4.ip_forward=1
+# ---------------------------------------------------------------------------
+# Cluster init
+# ---------------------------------------------------------------------------
+run_step "5. Initialize the Cluster (Run only on master)"
+if [[ -f /etc/kubernetes/admin.conf ]]; then
+    warn "Cluster already initialized (/etc/kubernetes/admin.conf exists), skipping kubeadm init"
+    warn "To start over: sudo kubeadm reset -f && sudo rm -rf /etc/cni/net.d"
+else
+    kubeadm init --pod-network-cidr="$POD_CIDR"
+fi
 echo ""
 
-run_step "15. Initialize the Cluster (Run only on master)"
-sudo kubeadm init --pod-network-cidr=10.244.0.0/16
+run_step "6. Set up kubeconfig for $TARGET_USER"
+mkdir -p "$USER_HOME/.kube"
+cp -f /etc/kubernetes/admin.conf "$USER_HOME/.kube/config"
+chown -R "$(id -u "$TARGET_USER"):$(id -g "$TARGET_USER")" "$USER_HOME/.kube"
+export KUBECONFIG=/etc/kubernetes/admin.conf
+log "kubeconfig installed at $USER_HOME/.kube/config"
 echo ""
 
-run_step "16. Create a .kube directory in your home directory"
-mkdir -p $HOME/.kube
-echo ""
-
-run_step "17. Copy the Kubernetes configuration file to your home directory"
-sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
-echo ""
-
-run_step "18. Change ownership of the file"
-sudo chown $(id -u):$(id -g) $HOME/.kube/config
-echo ""
-
-run_step "19. Install Flannel (Run only on master)"
+run_step "7. Install Flannel (Run only on master)"
 kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
 echo ""
 
-run_step "20. Verify Installation"
+run_step "8. Verify Installation"
 kubectl get pods --all-namespaces
 echo ""
 
-run_step "21. Generate Worker Join Command"
-JOIN_CMD=$(kubeadm token create --print-join-command)
-echo "$JOIN_CMD" > "$HOME/kubeadm_join_command.sh"
-chmod +x "$HOME/kubeadm_join_command.sh"
-log "Join command saved to $HOME/kubeadm_join_command.sh"
+run_step "9. Generate Worker Join Command"
+JOIN_CMD="$(kubeadm token create --print-join-command)"
+JOIN_FILE="$USER_HOME/kubeadm_join_command.sh"
+echo "$JOIN_CMD" > "$JOIN_FILE"
+chmod 700 "$JOIN_FILE"
+chown "$(id -u "$TARGET_USER"):$(id -g "$TARGET_USER")" "$JOIN_FILE"
+log "Join command saved to $JOIN_FILE"
 echo ""
 
-       echo "========================================================="
-       echo " Installation Complete!"
-       echo " Next steps:"
-       echo " 1. Copy the join command below to each worker node and"
-       echo "    run it with 'sudo kubeadm join ...' (or copy the"
-       echo "    kubeadm_join_command.sh file and run it as root):"
-       echo ""
-       echo "    $JOIN_CMD"
-       echo ""
-       echo " 2. On the worker, run ks8_install_worker.sh <join-command>"
-       echo "========================================================="
-       echo "Restart The Terminal"
+echo "========================================================="
+echo " Installation Complete!"
+echo " Next steps:"
+echo " 1. On each worker, run k8s-worker-install.sh with the join"
+echo "    command below (or run it later - tokens last 24 hours;"
+echo "    re-run this script or 'kubeadm token create"
+echo "    --print-join-command' for a fresh one):"
+echo ""
+echo "    sudo ./k8s-worker-install.sh $JOIN_CMD"
+echo ""
+echo " 2. On AWS, allow TCP 6443 (workers -> master) and 10250"
+echo "    (between nodes) in the security group."
+echo "========================================================="
+echo "Restart the terminal (or run 'newgrp docker') so group changes apply."

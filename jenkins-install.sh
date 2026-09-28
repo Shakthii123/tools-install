@@ -1,38 +1,32 @@
 #!/usr/bin/env bash
 #
-# install_jenkins.sh
-# Installs Jenkins (latest LTS) on Ubuntu/Debian, along with Java 21
-# and required dependencies, using the official pkg.jenkins.io repo.
+# jenkins-install.sh
+# Installs Jenkins (latest LTS) plus Java 21 on:
+#   - Ubuntu / Debian            (apt, official pkg.jenkins.io debian-stable repo)
+#   - Amazon Linux 2 / 2023      (yum/dnf, official pkg.jenkins.io redhat-stable repo,
+#                                 Amazon Corretto 21)
 #
 # Usage:
-#   chmod +x install_jenkins.sh
-#   sudo ./install_jenkins.sh
+#   chmod +x jenkins-install.sh
+#   sudo ./jenkins-install.sh
 #
 
 set -euo pipefail
+
 run_step() {
-     echo "==========$1==========="
-     sleep 3
+    echo "==========$1==========="
+    sleep 3
 }
 
-JENKINS_KEY_URL="https://pkg.jenkins.io/debian-stable/jenkins.io-2026.key"
-KEYRING_DIR="/etc/apt/keyrings"
-KEYRING_FILE="${KEYRING_DIR}/jenkins-keyring.asc"
-REPO_FILE="/etc/apt/sources.list.d/jenkins.list"
+log()  { echo -e "\n\033[1;32m==> $1\033[0m"; }
+warn() { echo -e "\033[1;33mWARN: $1\033[0m" >&2; }
+err()  { echo -e "\033[1;31mERROR: $1\033[0m" >&2; exit 1; }
 
-# ---- Helper functions -------------------------------------------------
+# Remove any carriage returns from this script (in case it was edited on Windows)
+SELF="${BASH_SOURCE[0]}"
+[[ -f "$SELF" ]] && sed -i 's/\r$//' "$SELF"
 
-log() {
-    echo -e "\n\033[1;32m==> $1\033[0m"
-}
-
-err() {
-    echo -e "\033[1;31mERROR: $1\033[0m" >&2
-    exit 1
-}
-
-# remove any carriage returns from this script (in case it was edited on Windows)
-sed -i 's/\r$//' jenkins-install.sh
+# ---- Pre-flight -------------------------------------------------------
 
 run_step "0. Pre-flight checks"
 
@@ -40,80 +34,128 @@ if [[ $EUID -ne 0 ]]; then
     err "This script must be run as root or with sudo. Try: sudo $0"
 fi
 
-if ! command -v apt-get &>/dev/null; then
-    err "This script only supports Debian/Ubuntu systems (apt-get not found)."
+os_field() { grep -E "^$1=" /etc/os-release | head -n1 | cut -d= -f2- | tr -d '"'; }
+OS_ID="$(os_field ID)"
+OS_ID_LIKE="$(os_field ID_LIKE)"
+
+case "$OS_ID" in
+    ubuntu|debian) FAMILY="debian" ;;
+    amzn)          FAMILY="amazon" ;;
+    *)
+        if [[ "$OS_ID_LIKE" == *debian* ]]; then
+            FAMILY="debian"
+        else
+            err "Unsupported OS '${OS_ID:-unknown}'. Supported: Ubuntu, Debian, Amazon Linux."
+        fi
+        ;;
+esac
+log "Detected OS: $OS_ID (family: $FAMILY)"
+
+if command -v dnf &>/dev/null; then PKG=dnf; else PKG=yum; fi
+
+# ---- Debian / Ubuntu --------------------------------------------------
+
+install_jenkins_debian() {
+    local key_url="https://pkg.jenkins.io/debian-stable/jenkins.io-2026.key"
+    local keyring_dir="/etc/apt/keyrings"
+    local keyring_file="${keyring_dir}/jenkins-keyring.asc"
+    local repo_file="/etc/apt/sources.list.d/jenkins.list"
+
+    run_step "1. Update package index"
+    apt-get update -y
+
+    run_step "2. Install prerequisites"
+    apt-get install -y wget gnupg ca-certificates apt-transport-https fontconfig
+
+    run_step "3. Install Java (Jenkins requires Java 21)"
+    apt-get install -y openjdk-21-jre
+    java -version
+
+    run_step "4. Clean up any old/broken Jenkins key or repo files"
+    rm -f /usr/share/keyrings/jenkins-keyring.asc "$keyring_file" "$repo_file"
+    mkdir -p "$keyring_dir"
+
+    run_step "5. Fetch the current Jenkins repository key"
+    wget -O "$keyring_file" "$key_url"
+    [[ -s "$keyring_file" ]] || err "Failed to download Jenkins key - $keyring_file is empty."
+
+    run_step "6. Add the Jenkins apt repository"
+    echo "deb [signed-by=${keyring_file}] https://pkg.jenkins.io/debian-stable binary/" \
+        | tee "$repo_file" >/dev/null
+
+    run_step "7. Install Jenkins"
+    apt-get update -y
+    apt-get install -y jenkins
+}
+
+# ---- Amazon Linux -----------------------------------------------------
+
+install_jenkins_amazon() {
+    local repo_file="/etc/yum.repos.d/jenkins.repo"
+
+    run_step "1. Install prerequisites"
+    $PKG install -y fontconfig
+
+    run_step "2. Install Java (Jenkins requires Java 21)"
+    if ! $PKG install -y java-21-amazon-corretto-headless; then
+        warn "Corretto 21 not in the default repos - adding the Amazon Corretto repo..."
+        rpm --import https://yum.corretto.aws/corretto.key
+        curl -fsSL -o /etc/yum.repos.d/corretto.repo https://yum.corretto.aws/corretto.repo
+        $PKG install -y java-21-amazon-corretto-devel
+    fi
+    java -version
+
+    run_step "3. Add the Jenkins yum repository"
+    rm -f "$repo_file"
+    curl -fsSL -o "$repo_file" https://pkg.jenkins.io/redhat-stable/jenkins.repo
+    [[ -s "$repo_file" ]] || err "Failed to download $repo_file"
+
+    # Import whatever signing key the repo file currently points at
+    local key_url
+    key_url="$(grep -E '^gpgkey=' "$repo_file" | head -n1 | cut -d= -f2- || true)"
+    if [[ -n "$key_url" ]]; then
+        log "Importing Jenkins key: $key_url"
+        rpm --import "$key_url"
+    fi
+
+    run_step "4. Install Jenkins"
+    $PKG install -y jenkins
+    systemctl daemon-reload
+}
+
+if [[ "$FAMILY" == "debian" ]]; then
+    install_jenkins_debian
+else
+    install_jenkins_amazon
 fi
 
-run_step "1. Update package index"
-
-log "Updating package index..."
-apt-get update -y
-
-run_step "2. Install prerequisites"
-
-log "Installing prerequisites (wget, gnupg, ca-certificates, fontconfig)..."
-apt-get install -y wget gnupg ca-certificates apt-transport-https fontconfig
-
-run_step "3. Install Java (Jenkins requires Java 21)"
-
-log "Installing OpenJDK 21 (required by Jenkins)..."
-apt-get install -y openjdk-21-jre
-
-java -version
-
-run_step "4. Clean up any old/broken Jenkins key or repo files"
-
-log "Removing any stale Jenkins keyring/repo files..."
-rm -f /usr/share/keyrings/jenkins-keyring.asc
-rm -f "$KEYRING_FILE"
-rm -f "$REPO_FILE"
-
-mkdir -p "$KEYRING_DIR"
-
-run_step "5. Fetch the current Jenkins repository key"
-
-log "Fetching Jenkins repository GPG key..."
-wget -O "$KEYRING_FILE" "$JENKINS_KEY_URL"
-
-if [[ ! -s "$KEYRING_FILE" ]]; then
-    err "Failed to download Jenkins key — $KEYRING_FILE is empty."
-fi
-
-run_step "6. Add the Jenkins apt repository"
-
-log "Adding Jenkins apt repository..."
-echo "deb [signed-by=${KEYRING_FILE}] https://pkg.jenkins.io/debian-stable binary/" \
-    | tee "$REPO_FILE" >/dev/null
-
-run_step "7. Install Jenkins"
-
-log "Updating package index with Jenkins repo..."
-apt-get update -y
-
-log "Installing Jenkins..."
-apt-get install -y jenkins
+# ---- Common -----------------------------------------------------------
 
 run_step "8. Start and enable Jenkins service"
-
-log "Enabling and starting Jenkins service..."
 systemctl enable jenkins
 systemctl start jenkins
 
-run_step "9. Configure firewall (if ufw is active) ------------------------------
-
-if command -v ufw &>/dev/null; then
-    if ufw status | grep -q "Status: active"; then
-        log "UFW detected and active. Allowing port 8080 (Jenkins)..."
-        ufw allow 8080/tcp
-    fi
+run_step "9. Configure firewall (if active)"
+if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
+    log "UFW active. Allowing port 8080 (Jenkins)..."
+    ufw allow 8080/tcp
+elif command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
+    log "firewalld active. Allowing port 8080 (Jenkins)..."
+    firewall-cmd --permanent --add-port=8080/tcp
+    firewall-cmd --reload
+else
+    log "No active host firewall detected (on AWS, open TCP 8080 in the instance's security group)."
 fi
 
 run_step "10. Show status and initial admin password"
-
-log "Checking Jenkins service status..."
 systemctl status jenkins --no-pager || true
 
-sleep 5
+# Jenkins can take a little while to generate the password on first start
+for _ in $(seq 1 30); do
+    [[ -f /var/lib/jenkins/secrets/initialAdminPassword ]] && break
+    sleep 2
+done
+
 log "Jenkins installation complete!"
 echo -e "\nAccess Jenkins in your browser at: http://<your-server-ip>:8080\n"
 
@@ -127,4 +169,4 @@ else
     echo "  sudo cat /var/lib/jenkins/secrets/initialAdminPassword"
 fi
 
-echo "sudo ss -tulnp | grep 8080"
+echo "To confirm Jenkins is listening:  sudo ss -tulnp | grep 8080"
