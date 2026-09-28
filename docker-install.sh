@@ -34,6 +34,7 @@ else
     apt-get update
     apt install util-linux-extra -y
     apt-get install docker.io -y
+    sudo apt-get install -y docker-buildx-plugin
 fi
 
 run_step "2. Starting Docker"
